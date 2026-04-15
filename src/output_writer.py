@@ -116,3 +116,119 @@ def write_outputs(
 
     logger.info(f"Successfully wrote 7 output files to: {output_path}")
     return str(output_path)
+
+
+def list_drafts(output_dir: str) -> list[dict]:
+    """List all existing draft directories in the output directory.
+
+    Scans for subdirectories containing both ``draft.md`` and
+    ``pipeline_log.json``. Reads metadata from the pipeline log.
+
+    Args:
+        output_dir: Base output directory to scan.
+
+    Returns:
+        A list of dicts sorted by slug, each with keys:
+        ``slug``, ``destination``, ``post_type``, ``focus_keyword``, ``path``.
+    """
+    output_path = Path(output_dir)
+    if not output_path.is_dir():
+        return []
+
+    drafts: list[dict] = []
+    for entry in output_path.iterdir():
+        if not entry.is_dir():
+            continue
+        draft_file = entry / "draft.md"
+        log_file = entry / "pipeline_log.json"
+        if not draft_file.exists() or not log_file.exists():
+            continue
+        try:
+            log_data = json.loads(log_file.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError) as exc:
+            logger.warning(f"Skipping {entry.name}: cannot read pipeline_log.json: {exc}")
+            continue
+        drafts.append(
+            {
+                "slug": entry.name,
+                "destination": log_data.get("destination", ""),
+                "post_type": log_data.get("post_type", ""),
+                "focus_keyword": log_data.get("focus_keyword", ""),
+                "path": str(entry),
+            }
+        )
+
+    drafts.sort(key=lambda d: d["slug"])
+    logger.debug(f"Found {len(drafts)} draft(s) in {output_dir}")
+    return drafts
+
+
+def save_revision(
+    output_dir: str,
+    slug: str,
+    draft: str,
+    enrichment_addition: str,
+    pipeline_log: dict,
+) -> str:
+    """Save a revision to an existing draft directory.
+
+    Overwrites ``draft.md`` and ``pipeline_log.json``, appends to
+    ``enrichment.md``. Does NOT touch ``seo.json``, ``social_promotion.json``,
+    ``social_ongoing.json``, or ``raw_notes.md``.
+
+    Args:
+        output_dir: Base output directory.
+        slug: The slug subdirectory name.
+        draft: The revised draft content.
+        enrichment_addition: New enrichment content to append.
+        pipeline_log: Updated pipeline log dict (with revisions array).
+
+    Returns:
+        The path to the slug subdirectory as a string.
+
+    Raises:
+        FileNotFoundError: If the slug directory does not exist.
+    """
+    output_path = Path(output_dir) / slug
+    if not output_path.is_dir():
+        raise FileNotFoundError(f"Draft directory not found: {output_path}")
+
+    logger.info(f"Saving revision to: {output_path}")
+
+    _write_text_file(output_path / "draft.md", draft)
+
+    enrichment_file = output_path / "enrichment.md"
+    existing_enrichment = ""
+    if enrichment_file.exists():
+        existing_enrichment = enrichment_file.read_text(encoding="utf-8")
+    _write_text_file(enrichment_file, existing_enrichment + enrichment_addition)
+
+    _write_json_file(output_path / "pipeline_log.json", pipeline_log)
+
+    logger.info(f"Revision saved to: {output_path}")
+    return str(output_path)
+
+
+def save_fact_check(output_dir: str, slug: str, fact_check: dict) -> str:
+    """Save a fact-check report to an existing draft directory.
+
+    Writes ``fact_check.json`` without touching any other output files.
+
+    Args:
+        output_dir: Base output directory.
+        slug: The slug subdirectory name.
+        fact_check: Fact-check report dict with claims, statuses, and sources.
+
+    Returns:
+        The path to the slug subdirectory as a string.
+
+    Raises:
+        FileNotFoundError: If the slug directory does not exist.
+    """
+    output_path = Path(output_dir) / slug
+    if not output_path.is_dir():
+        raise FileNotFoundError(f"Draft directory not found: {output_path}")
+
+    _write_json_file(output_path / "fact_check.json", fact_check)
+    logger.info(f"Fact-check report saved to: {output_path}")
+    return str(output_path)

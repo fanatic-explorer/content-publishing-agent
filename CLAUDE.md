@@ -65,7 +65,7 @@ content-publishing-agent/
 │   ├── keyword_researcher.py   # Keysearch API for keyword difficulty + competitors
 │   ├── telegram_sender.py      # Telegram Bot API — text message + file attachment
 │   ├── browser_fetcher.py      # Playwright headless Chrome for blocked sites
-│   └── output_writer.py        # Output file organization and writing
+│   └── output_writer.py        # Output file I/O, listing drafts, saving revisions
 ├── prompts/
 │   └── voice_document.md       # Fanatic Explorer writing voice (git-tracked)
 ├── tests/
@@ -82,6 +82,8 @@ content-publishing-agent/
 ├── .claude/
 │   ├── commands/
 │   │   ├── publish-trip.md     # Main pipeline slash command
+│   │   ├── revise-draft.md    # Revise existing draft with new research
+│   │   ├── fact-check.md      # Verify factual claims in a draft
 │   │   └── review.md           # Code review command
 │   └── rules/
 │       ├── coding-standards.md
@@ -129,9 +131,27 @@ VOICE_DOC_PATH=prompts/voice_document.md  # Voice document path
        6. DRAFT     → Claude writes blog post (voice doc + notes + enrichment + keyword)
        7. SEO       → keyword_researcher.py + Claude (keyword options + titles + meta)
        8. SOCIAL    → Claude generates promotion + ongoing content ideas
+     8.5. FACT-CHECK → Claude extracts claims, verifies via WebSearch + enrichment
        9. SAVE      → output_writer.py saves all outputs
       10. RECORD    → database.py marks as processed
       11. NOTIFY    → telegram_sender.py sends summary + draft attachment
+```
+
+**Three post types:** things-to-do, travel-guide, food-guide — each with different enrichment and structure.
+
+```
+/revise-draft (Claude Code slash command)
+  └─ interactive:
+       1. SETUP     → read voice document + conventions
+       2. SELECT    → list_drafts() shows available drafts, user picks one
+       3. LOAD      → read existing draft, enrichment, pipeline_log, seo
+       4. DIRECTIONS → user provides research directions
+       5. RESEARCH  → WebSearch + WebFetch for new content
+       6. REVISE    → Claude updates draft (voice doc + directions + research)
+     6.5. FACT-CHECK → Claude verifies new/modified content claims
+       7. SAVE      → save_revision() overwrites draft, appends enrichment
+       8. RECORD    → database.py logs revision steps (additive)
+       9. NOTIFY    → telegram_sender.py sends updated draft
 ```
 
 **Three post types:** things-to-do, travel-guide, food-guide — each with different enrichment and structure.

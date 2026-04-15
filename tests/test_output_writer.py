@@ -3,7 +3,15 @@
 import json
 from pathlib import Path
 
-from src.output_writer import generate_slug, write_outputs
+import pytest
+
+from src.output_writer import (
+    generate_slug,
+    list_drafts,
+    save_fact_check,
+    save_revision,
+    write_outputs,
+)
 
 # ---------------------------------------------------------------------------
 # Sample test data
@@ -393,3 +401,272 @@ class TestWriteOutputs:
         )
         content = (Path(result_path) / "raw_notes.md").read_text()
         assert "Travel notes about Jordan" in content
+
+
+# ---------------------------------------------------------------------------
+# Helper to create a valid draft directory for list_drafts / save_revision tests
+# ---------------------------------------------------------------------------
+
+
+def _create_draft_dir(
+    base: Path,
+    slug: str,
+    destination: str = "jordan",
+    post_type: str = "things-to-do",
+    focus_keyword: str = "things to do in jordan",
+) -> Path:
+    """Create a minimal valid draft directory with draft.md and pipeline_log.json."""
+    d = base / slug
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "draft.md").write_text("# Draft content")
+    (d / "enrichment.md").write_text("## Original enrichment")
+    (d / "seo.json").write_text(json.dumps({"primary_keyword": focus_keyword}))
+    (d / "social_promotion.json").write_text(json.dumps({"twitter": "tweet"}))
+    (d / "social_ongoing.json").write_text(json.dumps({"ideas": []}))
+    (d / "raw_notes.md").write_text("Raw notes here")
+    (d / "pipeline_log.json").write_text(
+        json.dumps(
+            {
+                "destination": destination,
+                "post_type": post_type,
+                "focus_keyword": focus_keyword,
+            }
+        )
+    )
+    return d
+
+
+# ---------------------------------------------------------------------------
+# list_drafts
+# ---------------------------------------------------------------------------
+
+
+class TestListDrafts:
+    def test_happy_path_lists_existing_drafts(self, tmp_path):
+        _create_draft_dir(tmp_path, "jordan-things-to-do-2026-03")
+        _create_draft_dir(
+            tmp_path, "agra-food-guide-2026-04", destination="agra", post_type="food-guide"
+        )
+        result = list_drafts(str(tmp_path))
+        assert len(result) == 2
+        slugs = [d["slug"] for d in result]
+        assert "agra-food-guide-2026-04" in slugs
+        assert "jordan-things-to-do-2026-03" in slugs
+
+    def test_empty_output_dir_returns_empty_list(self, tmp_path):
+        result = list_drafts(str(tmp_path))
+        assert result == []
+
+    def test_skips_directory_without_draft_md(self, tmp_path):
+        d = tmp_path / "no-draft-slug"
+        d.mkdir()
+        (d / "pipeline_log.json").write_text(json.dumps({"destination": "x", "post_type": "y"}))
+        # No draft.md — should be skipped
+        result = list_drafts(str(tmp_path))
+        assert result == []
+
+    def test_skips_directory_without_pipeline_log(self, tmp_path):
+        d = tmp_path / "no-log-slug"
+        d.mkdir()
+        (d / "draft.md").write_text("# Some draft")
+        # No pipeline_log.json — should be skipped
+        result = list_drafts(str(tmp_path))
+        assert result == []
+
+    def test_metadata_extracted_correctly(self, tmp_path):
+        _create_draft_dir(
+            tmp_path,
+            "agra-things-to-do-2026-03",
+            destination="Agra",
+            post_type="things-to-do",
+            focus_keyword="how to visit taj mahal",
+        )
+        result = list_drafts(str(tmp_path))
+        assert len(result) == 1
+        entry = result[0]
+        assert entry["slug"] == "agra-things-to-do-2026-03"
+        assert entry["destination"] == "Agra"
+        assert entry["post_type"] == "things-to-do"
+        assert entry["focus_keyword"] == "how to visit taj mahal"
+        assert entry["path"] == str(tmp_path / "agra-things-to-do-2026-03")
+
+    def test_results_sorted_by_slug(self, tmp_path):
+        _create_draft_dir(tmp_path, "z-slug", destination="z")
+        _create_draft_dir(tmp_path, "a-slug", destination="a")
+        _create_draft_dir(tmp_path, "m-slug", destination="m")
+        result = list_drafts(str(tmp_path))
+        slugs = [d["slug"] for d in result]
+        assert slugs == ["a-slug", "m-slug", "z-slug"]
+
+
+# ---------------------------------------------------------------------------
+# save_revision
+# ---------------------------------------------------------------------------
+
+
+class TestSaveRevision:
+    def test_overwrites_draft_with_new_content(self, tmp_path):
+        _create_draft_dir(tmp_path, "test-slug")
+        save_revision(
+            output_dir=str(tmp_path),
+            slug="test-slug",
+            draft="# Revised draft content",
+            enrichment_addition="\n## Revision 1\nNew research here",
+            pipeline_log={"destination": "jordan", "post_type": "things-to-do", "revisions": []},
+        )
+        content = (tmp_path / "test-slug" / "draft.md").read_text()
+        assert content == "# Revised draft content"
+
+    def test_enrichment_appended_not_replaced(self, tmp_path):
+        _create_draft_dir(tmp_path, "test-slug")
+        save_revision(
+            output_dir=str(tmp_path),
+            slug="test-slug",
+            draft="# Revised",
+            enrichment_addition="\n\n---\n## Revision 1\nNew research",
+            pipeline_log={"destination": "jordan", "post_type": "things-to-do"},
+        )
+        content = (tmp_path / "test-slug" / "enrichment.md").read_text()
+        assert "## Original enrichment" in content
+        assert "## Revision 1" in content
+        assert "New research" in content
+
+    def test_pipeline_log_updated(self, tmp_path):
+        _create_draft_dir(tmp_path, "test-slug")
+        updated_log = {
+            "destination": "jordan",
+            "post_type": "things-to-do",
+            "revisions": [{"revision_number": 1, "directions": "add food section"}],
+        }
+        save_revision(
+            output_dir=str(tmp_path),
+            slug="test-slug",
+            draft="# Revised",
+            enrichment_addition="\nNew stuff",
+            pipeline_log=updated_log,
+        )
+        content = json.loads((tmp_path / "test-slug" / "pipeline_log.json").read_text())
+        assert content["revisions"][0]["revision_number"] == 1
+
+    def test_seo_json_untouched(self, tmp_path):
+        _create_draft_dir(tmp_path, "test-slug")
+        original_seo = (tmp_path / "test-slug" / "seo.json").read_text()
+        save_revision(
+            output_dir=str(tmp_path),
+            slug="test-slug",
+            draft="# Revised",
+            enrichment_addition="\nNew",
+            pipeline_log={"destination": "jordan"},
+        )
+        assert (tmp_path / "test-slug" / "seo.json").read_text() == original_seo
+
+    def test_social_files_untouched(self, tmp_path):
+        _create_draft_dir(tmp_path, "test-slug")
+        original_promo = (tmp_path / "test-slug" / "social_promotion.json").read_text()
+        original_ongoing = (tmp_path / "test-slug" / "social_ongoing.json").read_text()
+        save_revision(
+            output_dir=str(tmp_path),
+            slug="test-slug",
+            draft="# Revised",
+            enrichment_addition="\nNew",
+            pipeline_log={"destination": "jordan"},
+        )
+        assert (tmp_path / "test-slug" / "social_promotion.json").read_text() == original_promo
+        assert (tmp_path / "test-slug" / "social_ongoing.json").read_text() == original_ongoing
+
+    def test_nonexistent_slug_raises_file_not_found(self, tmp_path):
+        with pytest.raises(FileNotFoundError):
+            save_revision(
+                output_dir=str(tmp_path),
+                slug="nonexistent-slug",
+                draft="# Revised",
+                enrichment_addition="\nNew",
+                pipeline_log={"destination": "jordan"},
+            )
+
+    def test_returns_output_path(self, tmp_path):
+        _create_draft_dir(tmp_path, "test-slug")
+        result = save_revision(
+            output_dir=str(tmp_path),
+            slug="test-slug",
+            draft="# Revised",
+            enrichment_addition="\nNew",
+            pipeline_log={"destination": "jordan"},
+        )
+        assert result == str(tmp_path / "test-slug")
+
+
+# ---------------------------------------------------------------------------
+# save_fact_check
+# ---------------------------------------------------------------------------
+
+SAMPLE_FACT_CHECK = {
+    "total_claims": 10,
+    "verified": 8,
+    "flagged": 1,
+    "unverified": 1,
+    "timestamp": "2026-03-23T14:00:00",
+    "claims": [
+        {
+            "claim": "Entry fee for foreign tourists is ₹1,100",
+            "category": "numbers_costs",
+            "status": "verified",
+            "source": "tajmahal.gov.in",
+            "note": None,
+        },
+    ],
+    "flagged_details": [
+        {
+            "claim": "Some claim",
+            "issue": "Draft says X but source says Y",
+            "recommended_correction": "Change X to Y",
+            "source": "example.com",
+        },
+    ],
+}
+
+
+class TestSaveFactCheck:
+    def test_happy_path_writes_fact_check_json(self, tmp_path):
+        _create_draft_dir(tmp_path, "test-slug")
+        save_fact_check(
+            output_dir=str(tmp_path),
+            slug="test-slug",
+            fact_check=SAMPLE_FACT_CHECK,
+        )
+        fc_path = tmp_path / "test-slug" / "fact_check.json"
+        assert fc_path.exists()
+        parsed = json.loads(fc_path.read_text())
+        assert parsed["total_claims"] == 10
+        assert parsed["verified"] == 8
+        assert parsed["flagged"] == 1
+        assert len(parsed["claims"]) == 1
+
+    def test_nonexistent_slug_raises_file_not_found(self, tmp_path):
+        with pytest.raises(FileNotFoundError):
+            save_fact_check(
+                output_dir=str(tmp_path),
+                slug="nonexistent-slug",
+                fact_check=SAMPLE_FACT_CHECK,
+            )
+
+    def test_does_not_touch_other_files(self, tmp_path):
+        _create_draft_dir(tmp_path, "test-slug")
+        original_draft = (tmp_path / "test-slug" / "draft.md").read_text()
+        original_seo = (tmp_path / "test-slug" / "seo.json").read_text()
+        save_fact_check(
+            output_dir=str(tmp_path),
+            slug="test-slug",
+            fact_check=SAMPLE_FACT_CHECK,
+        )
+        assert (tmp_path / "test-slug" / "draft.md").read_text() == original_draft
+        assert (tmp_path / "test-slug" / "seo.json").read_text() == original_seo
+
+    def test_returns_output_path(self, tmp_path):
+        _create_draft_dir(tmp_path, "test-slug")
+        result = save_fact_check(
+            output_dir=str(tmp_path),
+            slug="test-slug",
+            fact_check=SAMPLE_FACT_CHECK,
+        )
+        assert result == str(tmp_path / "test-slug")
