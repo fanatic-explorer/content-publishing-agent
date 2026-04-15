@@ -3,8 +3,33 @@
 Provides functions to look up keyword difficulty scores and competing URLs
 for given keyword strings. Gracefully degrades to null difficulty when the
 API key is missing or the API returns an error.
+
+Keysearch API notes (discovered by live probing — docs are incomplete):
+- Base URL: https://www.keysearch.co/api
+- Two relevant endpoints, distinguished by query param:
+  - /api?key=<K>&difficulty=<keyword>&cr=<country>  → single keyword lookup
+  - /api?key=<K>&list=<name>                         → bulk fetch of saved list
+- The `cr` (country) parameter is quirky:
+  - `cr=all`         → global (worldwide) search data  ← our default
+  - `cr=us` or empty → United States data
+  - `cr=global`, `worldwide`, etc. → NOT valid (returns cache miss)
+- The difficulty endpoint is a READ-through cache on top of the Keysearch
+  web UI. It only returns data for (keyword, location) pairs that have
+  been explicitly searched in the Keyword Research → Quick Difficulty
+  tool first. For new keywords, you get a text body:
+  "The keyword and location combination did not return results from your
+  account. The difficulty API is meant to access keywords already
+  searched within your account."
+- The saved-list endpoint (/api?list=<name>) bypasses this cache-seeding
+  issue and is the recommended path for pipeline use — see research_list().
+- Real response field names differ from a naive expectation:
+  - Difficulty score is under `score` (as a string like "36"), not `difficulty`
+  - SERP competitors are under `json_result` as a **JSON-encoded string**
+    that must be parsed again before use
+  - Each SERP item has `url` (lowercase) but `DA`, `PA` (uppercase), all strings
 """
 
+import json
 import logging
 import os
 import time
@@ -18,22 +43,44 @@ load_dotenv()
 logger = logging.getLogger(__name__)
 
 KEYSEARCH_API_URL = "https://www.keysearch.co/api"
-KEYSEARCH_COUNTRY = os.getenv("KEYSEARCH_COUNTRY", "us")
+# 'all' = global (worldwide) search data. 'us' = United States. See docstring above
+# for the full list of valid values. Override via KEYSEARCH_COUNTRY env var.
+KEYSEARCH_COUNTRY = os.getenv("KEYSEARCH_COUNTRY", "all")
 OWN_DOMAIN = "fanaticexplorer.com"
 
 
-def _filter_competitors(raw_results: list[dict]) -> list[dict]:
-    """Filter, deduplicate, and limit competitor result dicts to 5.
+def _to_int(value: object) -> int | None:
+    """Cast a Keysearch string value to int, returning None on failure."""
+    try:
+        return int(value)  # type: ignore[arg-type]
+    except (ValueError, TypeError):
+        return None
 
-    Removes entries with None/empty URLs, results from OWN_DOMAIN, and
-    duplicates. Preserves da/pa fields from the original result dicts.
+
+def _to_float(value: object) -> float | None:
+    """Cast a Keysearch string value to float, returning None on failure."""
+    try:
+        return float(value)  # type: ignore[arg-type]
+    except (ValueError, TypeError):
+        return None
+
+
+def _filter_competitors(raw_results: list[dict]) -> list[dict]:
+    """Filter, deduplicate, and limit Keysearch SERP competitor dicts to 5.
+
+    Keysearch returns SERP items inside the `json_result` field with keys
+    `url` (lowercase), `DA`, and `PA` (uppercase) — all as strings. This
+    function normalizes them to our internal shape with lowercase `da`/`pa`
+    as integers.
 
     Args:
-        raw_results: List of dicts with 'url', 'da', and 'pa' keys as
-            returned by the Keysearch API.
+        raw_results: List of SERP item dicts as parsed from the Keysearch
+            `json_result` field. Expected keys: `url`, `DA`, `PA`.
 
     Returns:
-        Up to 5 unique competitor dicts, each with 'url', 'da', and 'pa'.
+        Up to 5 unique competitor dicts, each with lowercase 'url', 'da'
+        (int or None), and 'pa' (int or None). Entries with empty URLs or
+        URLs from OWN_DOMAIN are excluded.
     """
     seen: set[str] = set()
     result: list[dict] = []
@@ -46,28 +93,40 @@ def _filter_competitors(raw_results: list[dict]) -> list[dict]:
         if url in seen:
             continue
         seen.add(url)
-        result.append({"url": url, "da": item.get("da"), "pa": item.get("pa")})
+        result.append(
+            {
+                "url": url,
+                "da": _to_int(item.get("DA")),
+                "pa": _to_int(item.get("PA")),
+            }
+        )
         if len(result) >= 5:
             break
     return result
 
 
 def research_keyword(keyword: str) -> dict:
-    """Research difficulty and competitor URLs for a keyword via Keysearch.
+    """Research difficulty and competitor URLs for a single keyword via Keysearch.
 
-    Calls the Keysearch API to obtain the keyword difficulty score and a list
-    of competing URLs for the given keyword. Returns null difficulty and an
-    empty competitors list when the API key is absent or the API call fails.
+    Calls the Keysearch difficulty endpoint for one (keyword, country) pair
+    and normalizes the response. Returns null difficulty and an empty
+    competitors list when the API key is absent, the API call fails, or the
+    keyword has not been pre-seeded in the Keysearch web dashboard (see the
+    module docstring for details on the cache-seeding requirement).
+
+    For bulk/pipeline use, prefer research_list() — it reads from a
+    persisted saved list and sidesteps the per-keyword cache-miss issue.
 
     Args:
-        keyword: The keyword string to research.
+        keyword: The keyword string to research. Uses KEYSEARCH_COUNTRY
+            (default 'all' = global) for the location.
 
     Returns:
         Dict with:
-            - 'keyword': the original keyword string.
-            - 'difficulty': int difficulty score from Keysearch, or None on failure.
-            - 'competitors': list of dicts with 'url', 'da', and 'pa' keys
-              (up to 5 entries, fanaticexplorer.com excluded, deduplicated).
+            - 'keyword': the original keyword string
+            - 'difficulty': int 0-100 Keysearch score, or None on failure
+            - 'competitors': list of dicts with 'url', 'da', 'pa' keys
+              (up to 5 entries, fanaticexplorer.com excluded, deduplicated)
 
     Raises:
         No exceptions are raised; all errors are caught and logged.
@@ -91,12 +150,16 @@ def research_keyword(keyword: str) -> dict:
             data = response.json()
         except ValueError as exc:
             body = (response.text or "")[:300]
+            # The difficulty endpoint returns cache-miss errors as plain text
+            # (not JSON-encoded), so response.json() raises. Detect the known
+            # "already searched" message and log a friendly warning.
             if "already searched within your account" in body:
                 logger.warning(
-                    f"Keysearch has no cached data for '{keyword}'. The Keysearch "
-                    f"difficulty API only returns keywords already searched in your "
-                    f"dashboard — log in to keysearch.co, search '{keyword}' once, "
-                    f"then retry."
+                    f"Keysearch has no cached data for '{keyword}' (country={KEYSEARCH_COUNTRY}). "
+                    f"The difficulty API only returns keywords already searched in your "
+                    f"Keysearch dashboard — log in to keysearch.co, run this keyword via "
+                    f"Keyword Research → Quick Difficulty with location='Global (All Locations)', "
+                    f"then retry. Or use research_list() with a pre-saved list."
                 )
             else:
                 logger.error(
@@ -104,8 +167,36 @@ def research_keyword(keyword: str) -> dict:
                 )
             return null_result
 
-        difficulty = data.get("difficulty")
-        raw_results = data.get("results", [])
+        # Defensive: the difficulty endpoint shouldn't return a string after a
+        # successful json() parse, but handle it for forward compatibility.
+        if isinstance(data, str):
+            logger.warning(
+                f"Keysearch returned unexpected string response for '{keyword}': {data!r}"
+            )
+            return null_result
+
+        if not isinstance(data, dict):
+            logger.error(
+                f"Unexpected Keysearch response type for '{keyword}': "
+                f"{type(data).__name__} — expected dict."
+            )
+            return null_result
+
+        difficulty = _to_int(data.get("score"))
+
+        # SERP competitors live under `json_result` as a nested JSON string
+        raw_serp_str = data.get("json_result") or "[]"
+        try:
+            raw_results = json.loads(raw_serp_str) if isinstance(raw_serp_str, str) else []
+        except json.JSONDecodeError as exc:
+            logger.error(
+                f"Failed to parse Keysearch json_result for '{keyword}': {exc} — "
+                f"body: {raw_serp_str[:200]!r}"
+            )
+            raw_results = []
+
+        if not isinstance(raw_results, list):
+            raw_results = []
 
         competitors = _filter_competitors(raw_results)
         return {"keyword": keyword, "difficulty": difficulty, "competitors": competitors}
@@ -138,22 +229,6 @@ def research_keywords_batch(keywords: list[str]) -> list[dict]:
         if index < len(keywords) - 1:
             time.sleep(1)
     return results
-
-
-def _to_int(value: object) -> int | None:
-    """Cast a Keysearch string value to int, returning None on failure."""
-    try:
-        return int(value)  # type: ignore[arg-type]
-    except (ValueError, TypeError):
-        return None
-
-
-def _to_float(value: object) -> float | None:
-    """Cast a Keysearch string value to float, returning None on failure."""
-    try:
-        return float(value)  # type: ignore[arg-type]
-    except (ValueError, TypeError):
-        return None
 
 
 def _normalize_list_item(item: dict) -> dict | None:

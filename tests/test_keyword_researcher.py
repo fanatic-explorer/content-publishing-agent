@@ -1,5 +1,6 @@
 """Tests for src/keyword_researcher.py — comprehensive TDD test suite."""
 
+import json
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -10,14 +11,33 @@ import pytest
 
 
 def _keysearch_response(urls=None, difficulty=42) -> dict:
-    """Build a fake Keysearch API response dict."""
+    """Build a fake Keysearch difficulty-endpoint response dict.
+
+    Matches the real API shape captured from live probing: top-level dict
+    with `score` (string), `keyword`, `location`, `cpc`, `ppc`, `volume`,
+    and `json_result` (a JSON-encoded string containing SERP items with
+    uppercase DA/PA keys).
+    """
     if urls is None:
         urls = [
-            {"url": "https://travelawaits.com/best-things-to-do-jordan/", "da": 72, "pa": 50},
-            {"url": "https://lonelyplanet.com/articles/jordan-travel-guide", "da": 91, "pa": 60},
-            {"url": "https://nomadicmatt.com/travel-guides/jordan/", "da": 65, "pa": 40},
+            {"url": "https://travelawaits.com/best-things-to-do-jordan/", "DA": "72", "PA": "50"},
+            {
+                "url": "https://lonelyplanet.com/articles/jordan-travel-guide",
+                "DA": "91",
+                "PA": "60",
+            },
+            {"url": "https://nomadicmatt.com/travel-guides/jordan/", "DA": "65", "PA": "40"},
         ]
-    return {"difficulty": difficulty, "results": urls}
+    return {
+        "id": "308484514",
+        "keyword": "test keyword",
+        "location": "all",
+        "cpc": "0.18",
+        "ppc": "0.78",
+        "volume": "260",
+        "score": str(difficulty),
+        "json_result": json.dumps(urls),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -55,8 +75,8 @@ class TestResearchKeyword:
         from src.keyword_researcher import research_keyword
 
         urls_with_own = [
-            {"url": "https://fanaticexplorer.com/jordan-guide/", "da": 50, "pa": 40},
-            {"url": "https://travelawaits.com/jordan/", "da": 72, "pa": 50},
+            {"url": "https://fanaticexplorer.com/jordan-guide/", "DA": "50", "PA": "40"},
+            {"url": "https://travelawaits.com/jordan/", "DA": "72", "PA": "50"},
         ]
         mock_resp = MagicMock()
         mock_resp.status_code = 200
@@ -73,7 +93,9 @@ class TestResearchKeyword:
     def test_returns_at_most_5_competitors(self, mock_requests):
         from src.keyword_researcher import research_keyword
 
-        many_urls = [{"url": f"https://site{i}.com/page/", "da": 50, "pa": 40} for i in range(10)]
+        many_urls = [
+            {"url": f"https://site{i}.com/page/", "DA": "50", "PA": "40"} for i in range(10)
+        ]
         mock_resp = MagicMock()
         mock_resp.status_code = 200
         mock_resp.json.return_value = _keysearch_response(urls=many_urls)
@@ -88,9 +110,9 @@ class TestResearchKeyword:
         from src.keyword_researcher import research_keyword
 
         urls_with_empties = [
-            {"url": None, "da": 50, "pa": 40},
-            {"url": "", "da": 50, "pa": 40},
-            {"url": "https://travelawaits.com/page/", "da": 72, "pa": 50},
+            {"url": None, "DA": "50", "PA": "40"},
+            {"url": "", "DA": "50", "PA": "40"},
+            {"url": "https://travelawaits.com/page/", "DA": "72", "PA": "50"},
         ]
         mock_resp = MagicMock()
         mock_resp.status_code = 200
@@ -109,8 +131,8 @@ class TestResearchKeyword:
         from src.keyword_researcher import research_keyword
 
         dup_urls = [
-            {"url": "https://travelawaits.com/page/", "da": 72, "pa": 50},
-            {"url": "https://travelawaits.com/page/", "da": 72, "pa": 50},
+            {"url": "https://travelawaits.com/page/", "DA": "72", "PA": "50"},
+            {"url": "https://travelawaits.com/page/", "DA": "72", "PA": "50"},
         ]
         mock_resp = MagicMock()
         mock_resp.status_code = 200
@@ -167,7 +189,7 @@ class TestResearchKeyword:
 
         mock_resp = MagicMock()
         mock_resp.status_code = 200
-        mock_resp.json.return_value = {"difficulty": 30, "results": []}
+        mock_resp.json.return_value = _keysearch_response(urls=[], difficulty=30)
         mock_resp.raise_for_status.return_value = None
         mock_requests.get.return_value = mock_resp
 
@@ -184,7 +206,9 @@ class TestResearchKeyword:
         assert result["difficulty"] is None
 
     @patch("src.keyword_researcher.requests")
-    def test_competitors_have_url_da_pa_keys(self, mock_requests):
+    def test_competitors_have_url_da_pa_keys_as_ints(self, mock_requests):
+        """DA/PA come from the API as uppercase strings ('72') and should be
+        normalized to lowercase int fields on our internal shape."""
         from src.keyword_researcher import research_keyword
 
         mock_resp = MagicMock()
@@ -198,6 +222,66 @@ class TestResearchKeyword:
             assert "url" in comp
             assert "da" in comp
             assert "pa" in comp
+            # DA/PA should be parsed from the API's string values into ints
+            assert isinstance(comp["da"], int)
+            assert isinstance(comp["pa"], int)
+        # Spot-check the specific values match the helper fixture
+        first = result["competitors"][0]
+        assert first["da"] == 72
+        assert first["pa"] == 50
+
+    @patch("src.keyword_researcher.requests")
+    def test_parses_json_result_string_field(self, mock_requests):
+        """The Keysearch difficulty endpoint returns SERP data under
+        `json_result` as a nested JSON STRING (not a list). Verify parsing."""
+        from src.keyword_researcher import research_keyword
+
+        # Explicit response matching the real Keysearch shape including the
+        # nested JSON-string field
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.raise_for_status.return_value = None
+        mock_resp.json.return_value = {
+            "id": "308484514",
+            "keyword": "jaipur travel guide",
+            "location": "all",
+            "cpc": "0.18",
+            "ppc": "0.78",
+            "volume": "260",
+            "score": "36",
+            "json_result": (
+                '[{"url":"https://thirdeyetraveller.com/jaipur/","PA":"36","DA":"43"},'
+                '{"url":"https://travelandleisure.com/jaipur","PA":"54","DA":"89"}]'
+            ),
+        }
+        mock_requests.get.return_value = mock_resp
+
+        result = research_keyword("jaipur travel guide")
+        assert result["difficulty"] == 36
+        assert len(result["competitors"]) == 2
+        assert result["competitors"][0]["url"] == "https://thirdeyetraveller.com/jaipur/"
+        assert result["competitors"][0]["da"] == 43
+        assert result["competitors"][0]["pa"] == 36
+        assert result["competitors"][1]["da"] == 89
+
+    @patch("src.keyword_researcher.requests")
+    def test_malformed_json_result_string_returns_empty_competitors(self, mock_requests):
+        from src.keyword_researcher import research_keyword
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.raise_for_status.return_value = None
+        mock_resp.json.return_value = {
+            "id": "1",
+            "keyword": "test",
+            "score": "42",
+            "json_result": "not valid json at all }}[{",
+        }
+        mock_requests.get.return_value = mock_resp
+
+        result = research_keyword("test")
+        assert result["difficulty"] == 42
+        assert result["competitors"] == []  # malformed json_result degrades gracefully
 
     @patch("src.keyword_researcher.requests")
     def test_calls_correct_api_url(self, mock_requests):
@@ -240,7 +324,8 @@ class TestResearchKeyword:
         )
 
     @patch("src.keyword_researcher.requests")
-    def test_sends_cr_country_param(self, mock_requests):
+    def test_sends_cr_country_param_defaults_to_all(self, mock_requests):
+        """Default KEYSEARCH_COUNTRY is 'all' (global)."""
         from src.keyword_researcher import research_keyword
 
         mock_resp = MagicMock()
@@ -252,17 +337,18 @@ class TestResearchKeyword:
         research_keyword("jordan travel")
 
         params = mock_requests.get.call_args.kwargs["params"]
-        assert params.get("cr") == "us"
+        assert params.get("cr") == "all"
 
     @patch("src.keyword_researcher.requests")
     def test_non_json_response_returns_null_difficulty(self, mock_requests):
+        """True non-JSON body (e.g. HTML error page) should not crash."""
         from src.keyword_researcher import research_keyword
 
         mock_resp = MagicMock()
         mock_resp.status_code = 200
         mock_resp.raise_for_status.return_value = None
         mock_resp.json.side_effect = ValueError("Expecting value: line 1 column 1 (char 0)")
-        mock_resp.text = "Some unexpected plain text body from the API"
+        mock_resp.text = "<html>unexpected error page</html>"
         mock_requests.get.return_value = mock_resp
 
         result = research_keyword("jordan travel")
@@ -271,7 +357,11 @@ class TestResearchKeyword:
         assert result["keyword"] == "jordan travel"
 
     @patch("src.keyword_researcher.requests")
-    def test_account_not_searched_message_logged_as_warning(self, mock_requests, caplog):
+    def test_account_not_searched_returns_null_and_warns(self, mock_requests, caplog):
+        """Real Keysearch cache-miss for the difficulty endpoint: HTTP 200
+        with a *plain text* body (not JSON-encoded), so response.json()
+        raises ValueError and we detect the error message from response.text.
+        """
         import logging
 
         from src.keyword_researcher import research_keyword
@@ -279,6 +369,8 @@ class TestResearchKeyword:
         mock_resp = MagicMock()
         mock_resp.status_code = 200
         mock_resp.raise_for_status.return_value = None
+        # Real difficulty-endpoint cache-miss behavior: body is plain text
+        # (not valid JSON), json() raises ValueError, and we check response.text.
         mock_resp.json.side_effect = ValueError("Expecting value: line 1 column 1 (char 0)")
         mock_resp.text = (
             "The keyword and location combination did not return results from "
@@ -291,6 +383,7 @@ class TestResearchKeyword:
             result = research_keyword("things to do in jaipur")
 
         assert result["difficulty"] is None
+        assert result["competitors"] == []
         warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
         assert warnings, "Expected a WARNING log entry for 'not searched in account'"
         combined = " ".join(r.getMessage() for r in warnings).lower()
