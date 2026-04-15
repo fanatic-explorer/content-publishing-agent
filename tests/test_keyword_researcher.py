@@ -199,6 +199,104 @@ class TestResearchKeyword:
             assert "da" in comp
             assert "pa" in comp
 
+    @patch("src.keyword_researcher.requests")
+    def test_calls_correct_api_url(self, mock_requests):
+        from src.keyword_researcher import research_keyword
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = _keysearch_response()
+        mock_resp.raise_for_status.return_value = None
+        mock_requests.get.return_value = mock_resp
+
+        research_keyword("things to do in jordan")
+
+        call_args = mock_requests.get.call_args
+        url = call_args[0][0] if call_args[0] else call_args[1].get("url")
+        assert url == "https://www.keysearch.co/api", (
+            f"Expected URL 'https://www.keysearch.co/api', got {url!r}. "
+            "Keysearch's documented endpoint is /api, not /api/difficulty."
+        )
+
+    @patch("src.keyword_researcher.requests")
+    def test_uses_difficulty_param_not_keyword(self, mock_requests):
+        from src.keyword_researcher import research_keyword
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = _keysearch_response()
+        mock_resp.raise_for_status.return_value = None
+        mock_requests.get.return_value = mock_resp
+
+        research_keyword("jordan travel")
+
+        params = mock_requests.get.call_args.kwargs["params"]
+        assert params.get("difficulty") == "jordan travel", (
+            "Keysearch API expects the keyword under the 'difficulty' query param, "
+            "not 'keyword' — see https://www.keysearch.co/api/documentation"
+        )
+        assert "keyword" not in params, (
+            "The 'keyword' param is not a valid Keysearch parameter and will be ignored."
+        )
+
+    @patch("src.keyword_researcher.requests")
+    def test_sends_cr_country_param(self, mock_requests):
+        from src.keyword_researcher import research_keyword
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = _keysearch_response()
+        mock_resp.raise_for_status.return_value = None
+        mock_requests.get.return_value = mock_resp
+
+        research_keyword("jordan travel")
+
+        params = mock_requests.get.call_args.kwargs["params"]
+        assert params.get("cr") == "us"
+
+    @patch("src.keyword_researcher.requests")
+    def test_non_json_response_returns_null_difficulty(self, mock_requests):
+        from src.keyword_researcher import research_keyword
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.raise_for_status.return_value = None
+        mock_resp.json.side_effect = ValueError("Expecting value: line 1 column 1 (char 0)")
+        mock_resp.text = "Some unexpected plain text body from the API"
+        mock_requests.get.return_value = mock_resp
+
+        result = research_keyword("jordan travel")
+        assert result["difficulty"] is None
+        assert result["competitors"] == []
+        assert result["keyword"] == "jordan travel"
+
+    @patch("src.keyword_researcher.requests")
+    def test_account_not_searched_message_logged_as_warning(self, mock_requests, caplog):
+        import logging
+
+        from src.keyword_researcher import research_keyword
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.raise_for_status.return_value = None
+        mock_resp.json.side_effect = ValueError("Expecting value: line 1 column 1 (char 0)")
+        mock_resp.text = (
+            "The keyword and location combination did not return results from "
+            "your account. The difficulty API is meant to access keywords already "
+            "searched within your account."
+        )
+        mock_requests.get.return_value = mock_resp
+
+        with caplog.at_level(logging.WARNING, logger="src.keyword_researcher"):
+            result = research_keyword("things to do in jaipur")
+
+        assert result["difficulty"] is None
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert warnings, "Expected a WARNING log entry for 'not searched in account'"
+        combined = " ".join(r.getMessage() for r in warnings).lower()
+        assert "things to do in jaipur" in combined
+        assert "keysearch" in combined or "dashboard" in combined
+
 
 # ---------------------------------------------------------------------------
 # research_keywords_batch

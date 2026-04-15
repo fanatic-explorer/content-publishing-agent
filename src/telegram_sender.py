@@ -9,7 +9,10 @@ import os
 import time
 
 import requests
+from dotenv import load_dotenv
 from requests.exceptions import HTTPError, Timeout
+
+load_dotenv()
 
 logger = logging.getLogger(__name__)
 

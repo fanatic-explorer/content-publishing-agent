@@ -10,11 +10,15 @@ import os
 import time
 
 import requests
+from dotenv import load_dotenv
 from requests.exceptions import HTTPError, Timeout
+
+load_dotenv()
 
 logger = logging.getLogger(__name__)
 
-KEYSEARCH_API_URL = "https://www.keysearch.co/api/difficulty"
+KEYSEARCH_API_URL = "https://www.keysearch.co/api"
+KEYSEARCH_COUNTRY = os.getenv("KEYSEARCH_COUNTRY", "us")
 OWN_DOMAIN = "fanaticexplorer.com"
 
 
@@ -78,12 +82,29 @@ def research_keyword(keyword: str) -> dict:
     try:
         response = requests.get(
             KEYSEARCH_API_URL,
-            params={"key": api_key, "keyword": keyword},
+            params={"key": api_key, "difficulty": keyword, "cr": KEYSEARCH_COUNTRY},
             timeout=15,
         )
         response.raise_for_status()
 
-        data = response.json()
+        try:
+            data = response.json()
+        except ValueError as exc:
+            body = (response.text or "")[:300]
+            if "already searched within your account" in body:
+                logger.warning(
+                    f"Keysearch has no cached data for '{keyword}'. The Keysearch "
+                    f"difficulty API only returns keywords already searched in your "
+                    f"dashboard — log in to keysearch.co, search '{keyword}' once, "
+                    f"then retry."
+                )
+            else:
+                logger.error(
+                    f"Keysearch returned non-JSON response for '{keyword}': {exc} — "
+                    f"body: {body!r}"
+                )
+            return null_result
+
         difficulty = data.get("difficulty")
         raw_results = data.get("results", [])
 
