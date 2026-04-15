@@ -25,9 +25,10 @@ Run the inbox scanner to list available destinations:
 
 ```
 uv run python -c "
-import json
+import json, os
+import dotenv
+dotenv.load_dotenv(os.path.join(os.getcwd(), '.env'))
 from src.inbox_scanner import list_destinations
-import os
 inbox_dir = os.getenv('INBOX_DIR', 'inbox')
 destinations = list_destinations(inbox_dir)
 print(json.dumps(destinations, indent=2))
@@ -46,9 +47,10 @@ Read all files from the selected destination folder:
 
 ```
 uv run python -c "
-import json
+import json, os
+import dotenv
+dotenv.load_dotenv(os.path.join(os.getcwd(), '.env'))
 from src.inbox_scanner import read_destination
-import os
 inbox_dir = os.getenv('INBOX_DIR', 'inbox')
 data = read_destination(inbox_dir, '<DESTINATION>')
 print(json.dumps(data, indent=2))
@@ -87,8 +89,10 @@ Check if this destination + post type combo was already processed:
 
 ```
 uv run python -c "
-from src.database import init_db, check_processed
 import os
+import dotenv
+dotenv.load_dotenv(os.path.join(os.getcwd(), '.env'))
+from src.database import init_db, check_processed
 db_path = os.getenv('DB_PATH', 'data/pipeline.db')
 init_db(db_path)
 result = check_processed(db_path, '<DESTINATION>', '<POST_TYPE>')
@@ -156,30 +160,49 @@ Write the full blog post following the structure defined in the voice document f
 
 ### Step 7: SEO — Keyword Research & Metadata
 
-Generate 5-8 candidate keywords based on the draft content and destination.
+Ask the user for the **Keysearch master list name** for this destination. The master list is a saved Keysearch list containing all the candidate keywords for that destination across every post type (things-to-do, travel-guide, food-guide, and any future posts). Keysearch strips non-alphanumeric characters from list names server-side, so a UI list named `jaipur_master_kws` is addressable as `jaipurmasterkws` via the API.
 
-Run keyword research via Keysearch:
+**If the user has a master list**, fetch it in one call:
 ```
 uv run python -c "
-import json
-from src.keyword_researcher import research_keywords_batch
-keywords = ['keyword1', 'keyword2', ...]
-results = research_keywords_batch(keywords)
-print(json.dumps(results, indent=2))
+import json, os
+import dotenv
+dotenv.load_dotenv(os.path.join(os.getcwd(), '.env'))
+from src.keyword_researcher import research_list
+result = research_list('<LIST_NAME>')
+print(json.dumps(result, indent=2))
 "
 ```
 
-Present a table to the user:
+Each item in the result has `keyword`, `difficulty` (int 0-100), `volume` (int), `cpc` (float), `competition` (float). Filter the items for keywords that match the current post type — e.g. for a Travel Guide, look for "travel guide", "itinerary", "how many days", "best time to visit" type keywords; for Things to Do, look for "things to do", "attractions", "places to visit", etc.
 
-| Keyword | Difficulty | Top Competitor (DA) | Recommendation |
-|---------|-----------|-------------------|----------------|
-| things to do in jordan | 35 | lonelyplanet.com (91) | Good — low difficulty, strong demand signal |
-| jordan travel guide | 52 | nomadicmatt.com (65) | Moderate — more competitive |
+**If the user does NOT have a master list**, walk them through one-time setup:
+1. Log in to [keysearch.co](https://www.keysearch.co)
+2. Navigate to **Keyword Research → Quick Difficulty**
+3. Set the location dropdown to **Global (All Locations)** — this matches the default `cr=all` used by our module
+4. Paste ~20-30 candidate keywords covering every post type for this destination (one per line, up to 50 per batch). Mix in long-tail variants and question-form keywords.
+5. Click **Search** and wait for difficulty scores to compute
+6. Tick all rows and click **Save Keywords** → create a new list. Use an alphanumeric-only name like `jaipurmasterkws`
+7. Tell the assistant the list name — it will re-run the `research_list` call above
 
-Recommend the best keyword (high demand signal + low difficulty). Then generate:
+After seeding, the list is persistent: future `/publish-trip` runs for the same destination skip the seeding step entirely and just call `research_list` directly.
+
+**If the master list is unavailable** (Keysearch API down, list name mistyped, etc.): proceed without difficulty data, select the focus keyword based on search-intent analysis alone, and note in `seo.json` that Keysearch data was unavailable. Do NOT fall back to `research_keywords_batch()` per-keyword lookups — those rely on per-(keyword, country) cache-seeding that will silently return null for unseeded keywords.
+
+Present a table to the user showing the candidate keywords ranked by a simple score (higher volume + lower difficulty = better):
+
+| Keyword | Difficulty | Volume | Recommendation |
+|---------|-----------|--------|----------------|
+| jaipur itinerary | 27 | 2,900 | Best — lowest difficulty, highest volume |
+| best things to do in jaipur | 40 | 590 | Moderate |
+| jaipur travel guide | 36 | 260 | Good — matches post type exactly |
+
+**Keyword selection must match search intent**: pick the keyword whose SERP results look like the post you're writing, not just the one with the best raw numbers. A "travel guide" post should own a "travel guide" keyword even if an "itinerary" keyword has higher volume — mismatched intent hurts rankings more than it helps.
+
+Then generate:
 - **3-5 title options** incorporating the chosen keyword
 - **Meta description** (under 160 characters)
-- **Focus keyword** selection with rationale
+- **Focus keyword** selection with rationale (cite the difficulty/volume numbers if available)
 
 ---
 
@@ -204,15 +227,46 @@ Each idea should include: hook line, content flow (what to show), and caption dr
 
 ---
 
+### Step 8.5: FACT-CHECK — Verify Factual Accuracy
+
+Before saving, scan the draft for verifiable factual claims:
+
+1. **Extract** all dates, numbers, prices, hours, historical facts, and attributions from the draft
+2. **Cross-reference** against the enrichment data gathered in Step 5
+3. **Verify high-risk claims** (fees, hours, policies) via WebSearch against official sources (official .gov sites, UNESCO, Wikipedia, Britannica)
+4. **For time-sensitive claims** (current fees, hours), use WebFetch on official monument websites to confirm
+5. **Present a summary** to the user:
+   - Number of claims checked
+   - Any flagged discrepancies (with recommended corrections)
+   - Any unverified claims
+
+If critical errors found (wrong dates, incorrect fees), fix them in the draft before proceeding to SAVE.
+If minor issues found (unverified but plausible claims), note them and proceed.
+
+Save the fact-check report using:
+```
+uv run python -c "
+import os
+import dotenv
+dotenv.load_dotenv(os.path.join(os.getcwd(), '.env'))
+from src.output_writer import save_fact_check
+output_dir = os.getenv('OUTPUT_DIR', 'output')
+save_fact_check(output_dir, '<SLUG>', <FACT_CHECK_DICT>)
+"
+```
+
+---
+
 ### Step 9: SAVE — Write All Outputs
 
 Save all outputs using the output writer:
 
 ```
 uv run python -c "
-import json
+import json, os
+import dotenv
+dotenv.load_dotenv(os.path.join(os.getcwd(), '.env'))
 from src.output_writer import generate_slug, write_outputs
-import os
 
 slug = generate_slug('<DESTINATION>', '<POST_TYPE>')
 output_dir = os.getenv('OUTPUT_DIR', 'output')
@@ -242,8 +296,10 @@ Record the completed pipeline run:
 
 ```
 uv run python -c "
-from src.database import init_db, save_post_record, save_pipeline_step
 import os
+import dotenv
+dotenv.load_dotenv(os.path.join(os.getcwd(), '.env'))
+from src.database import init_db, save_post_record, save_pipeline_step
 
 db_path = os.getenv('DB_PATH', 'data/pipeline.db')
 init_db(db_path)
@@ -265,6 +321,9 @@ Send a notification with the draft summary:
 
 ```
 uv run python -c "
+import os
+import dotenv
+dotenv.load_dotenv(os.path.join(os.getcwd(), '.env'))
 from src.telegram_sender import send_notification
 
 message = '''CONTENT PIPELINE — Draft Ready
@@ -295,6 +354,7 @@ send_notification(message, document_path='<OUTPUT_PATH>/draft.md')
 | DRAFT | Generation fails | **STOP** — nothing downstream works without a draft |
 | SEO | Keysearch fails | Continue — generate keywords without difficulty data |
 | SOCIAL | Generation fails | Continue — save draft without social content |
+| FACT-CHECK | Verification fails | Continue — save draft with disclaimer in pipeline_log |
 | SAVE | File write fails | **STOP** — critical error |
 | RECORD | DB write fails | Continue — outputs are already saved |
 | NOTIFY | Telegram fails | Continue — outputs are already saved, just tell user the path |

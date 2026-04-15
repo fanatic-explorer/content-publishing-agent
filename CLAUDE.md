@@ -196,10 +196,25 @@ Each `src/` file owns exactly one external concern. Do not mix API calls across 
 ## Key APIs
 
 ### Keysearch API (Keyword Research)
-- **Endpoint**: `GET https://www.keysearch.co/api/difficulty?key=<KEY>&keyword=<keyword>`
-- **Returns**: `{difficulty: int, results: [{url, da, pa}]}`
-- **Rate limit**: `time.sleep(1)` between calls.
-- **API key**: From `KEYSEARCH_API_KEY` env var.
+- **Base URL**: `https://www.keysearch.co/api` (note: NOT `/api/difficulty` — that's a 404)
+- **Auth**: `KEYSEARCH_API_KEY` env var, passed as `?key=<KEY>`
+- **Country**: `cr=<code>` query param. Defaults to `all` (global worldwide). `cr=us` = United States. `global`, `worldwide`, `Global` are NOT valid values and return cache misses — only `all` works. Override via `KEYSEARCH_COUNTRY` env var.
+
+**Two endpoints**:
+
+1. **`?list=<name>`** (recommended for pipeline use) — returns every keyword in a saved Keysearch list with difficulty, volume, CPC, and competition. One API call, no per-keyword seeding. Use `research_list()` in `keyword_researcher.py`. **List names are sanitized server-side** — non-alphanumeric characters are stripped, so a UI list named `jaipur_master_kws` is addressable as `jaipurmasterkws` via the API. Returns `"This list not Found..."` as a JSON-encoded string for missing lists.
+
+2. **`?difficulty=<keyword>&cr=<country>`** (ad-hoc single lookup) — returns one keyword's data. Use `research_keyword()`. **Requires pre-seeding**: the difficulty API only returns data for `(keyword, country)` pairs that have already been searched in the Keysearch web UI via **Keyword Research → Quick Difficulty** with the matching location dropdown. For unseeded keywords it returns a plain-text body (not JSON) saying "The keyword and location combination did not return results from your account" — `research_keyword()` catches this and logs a friendly warning with remediation steps.
+
+**Real response shape quirks** (discovered by live probing — Keysearch docs are incomplete):
+- Difficulty score is under `score` (string), not `difficulty`
+- SERP competitors are under `json_result` as a **JSON-encoded string** that must be `json.loads`-ed a second time
+- SERP items use **uppercase `DA`, `PA`** (not lowercase) and all numeric values are strings
+- Content-type is `text/html` even for successful JSON responses
+
+**Rate limit**: Add `time.sleep(1)` between calls to `research_keyword()`. The `research_list()` function is one-shot so rate limiting is not a concern.
+
+**Pipeline workflow** (per `/publish-trip` Step 7): maintain one Keysearch saved list per destination with all candidate keywords across every post type. Seed it once via Quick Difficulty with location=Global (All Locations), save with an alphanumeric name, then every `/publish-trip` call for that destination becomes a zero-friction `research_list()` lookup.
 
 ### Telegram Bot API (Notifications)
 - **Auth**: Bot token in `TELEGRAM_BOT_TOKEN` env var.
