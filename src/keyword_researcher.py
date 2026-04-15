@@ -100,8 +100,7 @@ def research_keyword(keyword: str) -> dict:
                 )
             else:
                 logger.error(
-                    f"Keysearch returned non-JSON response for '{keyword}': {exc} — "
-                    f"body: {body!r}"
+                    f"Keysearch returned non-JSON response for '{keyword}': {exc} — body: {body!r}"
                 )
             return null_result
 
