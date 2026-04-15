@@ -381,3 +381,309 @@ class TestResearchKeywordsBatch:
         keywords = ["alpha keyword", "beta keyword", "gamma keyword"]
         result = research_keywords_batch(keywords)
         assert [r["keyword"] for r in result] == keywords
+
+
+# ---------------------------------------------------------------------------
+# research_list — bulk fetch from a saved Keysearch list
+# ---------------------------------------------------------------------------
+
+
+def _list_response(items=None):
+    """Build a fake Keysearch /api?list= response.
+
+    Matches the real response shape captured from live API: a top-level JSON
+    array of dicts with string values for all numeric fields (keyword,
+    volume, cpc, competition, score).
+    """
+    if items is None:
+        items = [
+            {
+                "keyword": "jaipur travel guide",
+                "volume": "260",
+                "cpc": "0.18",
+                "competition": "0.78",
+                "score": "36",
+            },
+            {
+                "keyword": "best things to do in jaipur",
+                "volume": "590",
+                "cpc": "0.11",
+                "competition": "0.41",
+                "score": "40",
+            },
+            {
+                "keyword": "jaipur itinerary",
+                "volume": "2900",
+                "cpc": "0.13",
+                "competition": "0.35",
+                "score": "27",
+            },
+        ]
+    return items
+
+
+class TestResearchList:
+    @pytest.fixture(autouse=True)
+    def set_keysearch_key(self, monkeypatch):
+        """Ensure KEYSEARCH_API_KEY is set so tests exercise the real path."""
+        monkeypatch.setenv("KEYSEARCH_API_KEY", "test-key")
+
+    @patch("src.keyword_researcher.requests")
+    def test_happy_path_returns_normalized_keywords(self, mock_requests):
+        from src.keyword_researcher import research_list
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.raise_for_status.return_value = None
+        mock_resp.json.return_value = _list_response()
+        mock_requests.get.return_value = mock_resp
+
+        result = research_list("jaipurtestlist")
+
+        assert isinstance(result, list)
+        assert len(result) == 3
+        first = result[0]
+        assert first["keyword"] == "jaipur travel guide"
+        assert first["difficulty"] == 36
+        assert first["volume"] == 260
+        assert first["cpc"] == 0.18
+        assert first["competition"] == 0.78
+        # list endpoint does not return SERP competitors — empty for API consistency
+        assert first["competitors"] == []
+
+    @patch("src.keyword_researcher.requests")
+    def test_calls_correct_endpoint_with_list_param(self, mock_requests):
+        from src.keyword_researcher import research_list
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.raise_for_status.return_value = None
+        mock_resp.json.return_value = []
+        mock_requests.get.return_value = mock_resp
+
+        research_list("jaipurtestlist")
+
+        call_args = mock_requests.get.call_args
+        url = call_args[0][0] if call_args[0] else call_args[1].get("url")
+        assert url == "https://www.keysearch.co/api"
+        params = call_args.kwargs["params"]
+        assert params.get("list") == "jaipurtestlist"
+        assert params.get("key") == "test-key"
+        # cr/country is NOT passed for list endpoint — list is stored server-side
+        assert "cr" not in params
+        # difficulty= is NOT passed either
+        assert "difficulty" not in params
+
+    @patch("src.keyword_researcher.requests")
+    def test_deduplicates_keywords_keeping_max_volume(self, mock_requests):
+        """Real Keysearch behavior: same keyword can appear multiple times."""
+        from src.keyword_researcher import research_list
+
+        items = [
+            {
+                "keyword": "jaipur travel guide",
+                "volume": "10",
+                "cpc": "0",
+                "competition": "0",
+                "score": "39",
+            },
+            {
+                "keyword": "jaipur travel guide",
+                "volume": "260",
+                "cpc": "0.18",
+                "competition": "0.78",
+                "score": "36",
+            },
+        ]
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.raise_for_status.return_value = None
+        mock_resp.json.return_value = items
+        mock_requests.get.return_value = mock_resp
+
+        result = research_list("jaipurtestlist")
+
+        assert len(result) == 1
+        assert result[0]["keyword"] == "jaipur travel guide"
+        assert result[0]["volume"] == 260  # kept the higher-volume entry
+        assert result[0]["difficulty"] == 36
+        assert result[0]["cpc"] == 0.18
+
+    @patch("src.keyword_researcher.requests")
+    def test_preserves_first_seen_order_across_dedup(self, mock_requests):
+        from src.keyword_researcher import research_list
+
+        items = [
+            {"keyword": "alpha", "volume": "100", "cpc": "0", "competition": "0", "score": "10"},
+            {"keyword": "beta", "volume": "50", "cpc": "0", "competition": "0", "score": "20"},
+            {"keyword": "alpha", "volume": "200", "cpc": "0", "competition": "0", "score": "15"},
+            {"keyword": "gamma", "volume": "75", "cpc": "0", "competition": "0", "score": "30"},
+        ]
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.raise_for_status.return_value = None
+        mock_resp.json.return_value = items
+        mock_requests.get.return_value = mock_resp
+
+        result = research_list("mixed")
+        keywords_in_order = [r["keyword"] for r in result]
+        assert keywords_in_order == ["alpha", "beta", "gamma"]
+        # alpha's volume is the higher of the two duplicates (200)
+        assert result[0]["volume"] == 200
+
+    @patch("src.keyword_researcher.requests")
+    def test_list_not_found_returns_empty_list(self, mock_requests):
+        """Real Keysearch error: JSON-encoded string body."""
+        from src.keyword_researcher import research_list
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.raise_for_status.return_value = None
+        mock_resp.json.return_value = "This list not Found Please search other list"
+        mock_requests.get.return_value = mock_resp
+
+        result = research_list("nonexistent_list")
+        assert result == []
+
+    @patch("src.keyword_researcher.requests")
+    def test_list_not_found_logs_warning_with_name_hint(self, mock_requests, caplog):
+        import logging
+
+        from src.keyword_researcher import research_list
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.raise_for_status.return_value = None
+        mock_resp.json.return_value = "This list not Found Please search other list"
+        mock_requests.get.return_value = mock_resp
+
+        with caplog.at_level(logging.WARNING, logger="src.keyword_researcher"):
+            research_list("my_test_list")
+
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert warnings
+        combined = " ".join(r.getMessage() for r in warnings).lower()
+        assert "my_test_list" in combined
+        # Hint should mention the alphanumeric-only transformation
+        assert "alphanumeric" in combined or "non-alphanumeric" in combined or "strip" in combined
+
+    @patch("src.keyword_researcher.requests")
+    def test_empty_list_returns_empty(self, mock_requests):
+        from src.keyword_researcher import research_list
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.raise_for_status.return_value = None
+        mock_resp.json.return_value = []
+        mock_requests.get.return_value = mock_resp
+
+        result = research_list("empty_list")
+        assert result == []
+
+    @patch("src.keyword_researcher.requests")
+    def test_missing_api_key_returns_empty(self, mock_requests, monkeypatch):
+        from src.keyword_researcher import research_list
+
+        monkeypatch.delenv("KEYSEARCH_API_KEY", raising=False)
+        result = research_list("any_list")
+        assert result == []
+        mock_requests.get.assert_not_called()
+
+    @patch("src.keyword_researcher.requests")
+    def test_http_401_returns_empty(self, mock_requests):
+        from requests.exceptions import HTTPError
+
+        from src.keyword_researcher import research_list
+
+        mock_resp = MagicMock()
+        mock_resp.raise_for_status.side_effect = HTTPError("401 Unauthorized")
+        mock_requests.get.return_value = mock_resp
+
+        result = research_list("any_list")
+        assert result == []
+
+    @patch("src.keyword_researcher.requests")
+    def test_timeout_returns_empty(self, mock_requests):
+        from requests.exceptions import Timeout
+
+        from src.keyword_researcher import research_list
+
+        mock_requests.get.side_effect = Timeout("Connection timed out")
+
+        result = research_list("any_list")
+        assert result == []
+
+    @patch("src.keyword_researcher.requests")
+    def test_non_json_response_returns_empty(self, mock_requests):
+        from src.keyword_researcher import research_list
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.raise_for_status.return_value = None
+        mock_resp.json.side_effect = ValueError("Expecting value: line 1 column 1 (char 0)")
+        mock_resp.text = "<html>unexpected error page</html>"
+        mock_requests.get.return_value = mock_resp
+
+        result = research_list("any_list")
+        assert result == []
+
+    @patch("src.keyword_researcher.requests")
+    def test_unexpected_dict_response_returns_empty(self, mock_requests):
+        """Defensive: if Keysearch ever changes to a dict wrapper, don't crash."""
+        from src.keyword_researcher import research_list
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.raise_for_status.return_value = None
+        mock_resp.json.return_value = {"unexpected": "wrapper"}
+        mock_requests.get.return_value = mock_resp
+
+        result = research_list("any_list")
+        assert result == []
+
+    @patch("src.keyword_researcher.requests")
+    def test_malformed_numeric_values_normalized_to_none(self, mock_requests):
+        """Keysearch can return empty strings or non-numeric values."""
+        from src.keyword_researcher import research_list
+
+        items = [
+            {
+                "keyword": "edge case kw",
+                "volume": "",
+                "cpc": "N/A",
+                "competition": "",
+                "score": "",
+            },
+        ]
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.raise_for_status.return_value = None
+        mock_resp.json.return_value = items
+        mock_requests.get.return_value = mock_resp
+
+        result = research_list("edge")
+        assert len(result) == 1
+        assert result[0]["keyword"] == "edge case kw"
+        assert result[0]["difficulty"] is None
+        assert result[0]["volume"] is None
+        assert result[0]["cpc"] is None
+        assert result[0]["competition"] is None
+
+    @patch("src.keyword_researcher.requests")
+    def test_item_without_keyword_field_skipped(self, mock_requests):
+        from src.keyword_researcher import research_list
+
+        items = [
+            {"keyword": "valid", "volume": "100", "cpc": "1", "competition": "0.5", "score": "30"},
+            {"volume": "50"},  # missing keyword — should be skipped
+            {"keyword": "", "volume": "75"},  # empty keyword — should be skipped
+        ]
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.raise_for_status.return_value = None
+        mock_resp.json.return_value = items
+        mock_requests.get.return_value = mock_resp
+
+        result = research_list("mixed")
+        assert len(result) == 1
+        assert result[0]["keyword"] == "valid"
